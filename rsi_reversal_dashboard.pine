@@ -1,0 +1,560 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  RSI 70/30 Reversal Dashboard — Binance Futures (5m execution + 15m trend)
+//  Indicator: dashboard + confirmed LONG/SHORT signals + TradingView alerts.
+//  Put it on a 5-minute chart (e.g. BINANCE:BTCUSDT.P).
+//  Not financial advice. No profitability is claimed or implied.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("RSI 70/30 Reversal Dashboard (5m + 15m)", shorttitle="RSI-REV", overlay=true, max_labels_count=200)
+
+// ═════════════════════════════ INPUTS ═════════════════════════════
+G_RSI  = "1 · RSI"
+G_MA   = "2 · MA Ribbon"
+G_ST   = "3 · Supertrend"
+G_MTF  = "4 · 15m trend filter"
+G_CONF = "5 · Confirmation rules"
+G_RISK = "6 · Stop / target / risk / costs"
+G_ALRT = "7 · Alerts"
+G_UI   = "8 · Dashboard"
+
+rsiLen      = input.int(14, "RSI length", minval=2, group=G_RSI)
+rsiOS       = input.float(30.0, "Oversold level", group=G_RSI)
+rsiOB       = input.float(70.0, "Overbought level", group=G_RSI)
+turnMin     = input.float(1.0, "Min RSI rebound to count as a 'turn'", minval=0.0, step=0.5, group=G_RSI, tooltip="After RSI makes its extreme, it must move at least this many RSI points away (and be rising/falling) before the turn counts.")
+rearmBuf    = input.float(10.0, "Re-arm buffer (RSI points)", minval=1.0, step=1.0, group=G_RSI, tooltip="After a signal or an expired setup, RSI must leave the extreme zone by this many points (LONG: back above 30+buffer, SHORT: below 70-buffer) before a NEW setup can arm. This is what prevents duplicate signals for the same RSI cycle.")
+longCancel  = input.float(60.0, "LONG setup cancelled if RSI rises above", group=G_RSI, tooltip="Anti-chasing: if RSI is already this high, the reversal move is considered spent.")
+shortCancel = input.float(40.0, "SHORT setup cancelled if RSI falls below", group=G_RSI)
+maxWatch    = input.int(36, "Max bars a setup stays armed", minval=3, group=G_RSI, tooltip="36 bars on 5m = 3 hours. An expired setup is locked until RSI leaves the extreme zone.")
+
+emaA = input.int(7,   "EMA 1", minval=1, group=G_MA)
+emaB = input.int(20,  "EMA 2", minval=1, group=G_MA)
+emaC = input.int(50,  "EMA 3", minval=1, group=G_MA)
+emaD = input.int(200, "EMA 4", minval=1, group=G_MA)
+
+stLen  = input.int(12, "Supertrend ATR length", minval=1, group=G_ST)
+stMult = input.float(4.0, "Supertrend multiplier", minval=0.1, step=0.1, group=G_ST)
+
+htfTf      = input.timeframe("15", "Trend timeframe", group=G_MTF)
+strictMode = input.bool(false, "STRICT MODE: require 15m trend agreement", group=G_MTF, tooltip="OFF: countertrend reversals are allowed but labelled COUNTERTREND and need extra EMA score. ON: signals fire only when the 15m trend agrees with the trade direction.")
+agreeBasis = input.string("Supertrend + Ribbon", "What counts as 15m agreement", options=["Supertrend + Ribbon", "Supertrend only", "Ribbon only"], group=G_MTF)
+ctExtra    = input.int(1, "Extra EMA score needed for countertrend", minval=0, maxval=3, group=G_MTF)
+
+stMode      = input.string("State (bullish/bearish now)", "5m Supertrend confirmation", options=["State (bullish/bearish now)", "Fresh flip after RSI extreme"], group=G_CONF)
+minEmaScore = input.int(3, "Min EMA score (0-5)", minval=0, maxval=5, group=G_CONF, tooltip="LONG score = EMA7>EMA20, close>EMA20, EMA7 crossed above EMA20 within N bars, close>EMA50, close>EMA200 (SHORT mirrors it).")
+crossBars   = input.int(5, "EMA7/EMA20 cross counts if within N bars", minval=1, group=G_CONF)
+needE200    = input.bool(false, "Also require price beyond EMA 200", group=G_CONF)
+
+rr         = input.float(2.0, "Reward : risk (TP multiple of stop distance)", minval=0.5, step=0.25, group=G_RISK)
+minStopPct = input.float(0.10, "Reject if stop closer than (%)", minval=0.0, step=0.05, group=G_RISK)
+maxStopPct = input.float(2.50, "Reject if stop farther than (%)", minval=0.1, step=0.1, group=G_RISK)
+acctSize   = input.float(1000.0, "Account size (USDT)", minval=1.0, group=G_RISK)
+riskPct    = input.float(1.0, "Risk per trade (% of account)", minval=0.1, step=0.1, group=G_RISK)
+feePct     = input.float(0.05, "Fee per side (%)", minval=0.0, step=0.01, group=G_RISK, tooltip="Used for the on-chart simulated stats only. Check your Binance fee tier.")
+slipPct    = input.float(0.02, "Slippage per side (%)", minval=0.0, step=0.01, group=G_RISK)
+
+useAlertFn = input.bool(true, "Send dynamic alert() messages (use 'Any alert() function call')", group=G_ALRT)
+
+showTable = input.bool(true, "Show dashboard", group=G_UI)
+tblPos    = input.string(position.top_right, "Position", options=[position.top_left, position.top_center, position.top_right, position.middle_left, position.middle_right, position.bottom_left, position.bottom_center, position.bottom_right], group=G_UI)
+tSz       = input.string(size.small, "Text size", options=[size.tiny, size.small, size.normal, size.large], group=G_UI)
+showStats = input.bool(true, "Show simulated stats", group=G_UI)
+showHist  = input.bool(true, "Show last 5 signals", group=G_UI)
+holdBars  = input.int(6, "Keep CONFIRMED status for N bars", minval=1, group=G_UI)
+cLong     = input.color(#00C853, "LONG colour", group=G_UI)
+cShort    = input.color(#FF1744, "SHORT colour", group=G_UI)
+cWatch    = input.color(#FFB300, "WATCH colour", group=G_UI)
+
+// ═════════════════════════════ CORE SERIES (chart TF = 5m) ═════════════════════════════
+rsi5 = ta.rsi(close, rsiLen)
+[st5, st5Dir] = ta.supertrend(stMult, stLen)   // dir < 0 = bullish, dir > 0 = bearish
+e1 = ta.ema(close, emaA)
+e2 = ta.ema(close, emaB)
+e3 = ta.ema(close, emaC)
+e4 = ta.ema(close, emaD)
+
+st5Bull  = st5Dir < 0
+st5Bear  = st5Dir > 0
+stFlipUp = st5Dir < 0 and nz(st5Dir[1]) > 0
+stFlipDn = st5Dir > 0 and nz(st5Dir[1]) < 0
+
+// ═════════════════════════════ 15m DATA — NON-REPAINTING ═════════════════════════════
+// Uses [1] + lookahead_on: always the last FULLY CLOSED higher-TF bar, identical on history and live.
+htfPack() =>
+    float r = ta.rsi(close, rsiLen)
+    [stl, d] = ta.supertrend(stMult, stLen)
+    float x1 = ta.ema(close, emaA)
+    float x2 = ta.ema(close, emaB)
+    float x3 = ta.ema(close, emaC)
+    float x4 = ta.ema(close, emaD)
+    [r[1], d[1], x1[1], x2[1], x3[1], x4[1], close[1]]
+
+[rsiH, dirH, h1, h2, h3, h4, clH] = request.security(syminfo.tickerid, htfTf, htfPack(), lookahead=barmerge.lookahead_on)
+
+htfBullST  = dirH < 0
+htfBearST  = dirH > 0
+htfRibBull = h1 > h2 and h2 > h3
+htfRibBear = h1 < h2 and h2 < h3
+
+alignL = agreeBasis == "Supertrend only" ? htfBullST : agreeBasis == "Ribbon only" ? htfRibBull : (htfBullST and htfRibBull)
+alignS = agreeBasis == "Supertrend only" ? htfBearST : agreeBasis == "Ribbon only" ? htfRibBear : (htfBearST and htfRibBear)
+
+// ═════════════════════════════ EMA ANALYSIS ═════════════════════════════
+sinceUp = ta.barssince(ta.crossover(e1, e2))
+sinceDn = ta.barssince(ta.crossunder(e1, e2))
+
+scoreL = (e1 > e2 ? 1 : 0) + (close > e2 ? 1 : 0) + (nz(sinceUp, 9999) <= crossBars ? 1 : 0) + (close > e3 ? 1 : 0) + (close > e4 ? 1 : 0)
+scoreS = (e1 < e2 ? 1 : 0) + (close < e2 ? 1 : 0) + (nz(sinceDn, 9999) <= crossBars ? 1 : 0) + (close < e3 ? 1 : 0) + (close < e4 ? 1 : 0)
+
+needL = math.min(5, minEmaScore + (alignL ? 0 : ctExtra))
+needS = math.min(5, minEmaScore + (alignS ? 0 : ctExtra))
+
+emaOkL = scoreL >= needL and (not needE200 or close > e4)
+emaOkS = scoreS >= needS and (not needE200 or close < e4)
+
+// ═════════════════════════════ STOP VALIDATION ═════════════════════════════
+distL = close - st5
+distS = st5 - close
+pctL  = distL / close * 100
+pctS  = distS / close * 100
+stopOkL = st5Bull and st5 < close and pctL >= minStopPct and pctL <= maxStopPct
+stopOkS = st5Bear and st5 > close and pctS >= minStopPct and pctS <= maxStopPct
+stopTxtL = not st5Bull ? "Stop n/a (5m ST bearish)" : pctL > maxStopPct ? "Rejected: stop " + str.tostring(pctL, "#.##") + "% too far" : pctL < minStopPct ? "Rejected: stop too tight" : "Stop OK"
+stopTxtS = not st5Bear ? "Stop n/a (5m ST bullish)" : pctS > maxStopPct ? "Rejected: stop " + str.tostring(pctS, "#.##") + "% too far" : pctS < minStopPct ? "Rejected: stop too tight" : "Stop OK"
+
+// ═════════════════════════════ SETUP STATE MACHINES ═════════════════════════════
+// LONG
+var bool  lArmed  = false
+var bool  lLocked = false
+var bool  lTurn   = false
+var bool  lFlip   = false
+var int   lArmBar = 0
+var float lExt    = na
+bool lArmEvt = false
+
+if lLocked and rsi5 >= rsiOS + rearmBuf
+    lLocked := false
+if not lLocked and rsi5 <= rsiOS
+    if not lArmed
+        lArmed  := true
+        lTurn   := false
+        lFlip   := false
+        lArmBar := bar_index
+        lExt    := rsi5
+        lArmEvt := true
+    else if rsi5 < lExt
+        lExt  := rsi5
+        lTurn := false
+        lFlip := false
+if lArmed
+    if rsi5 > rsi5[1] and rsi5 - lExt >= turnMin
+        lTurn := true
+    if stFlipUp
+        lFlip := true
+
+lStOk  = st5Bull and (stMode == "Fresh flip after RSI extreme" ? lFlip : true)
+lMtfOk = not strictMode or alignL
+lRsiOk = rsi5 <= longCancel
+lReady = lArmed and lTurn and lStOk and emaOkL and lMtfOk and stopOkL and lRsiOk
+sigLong = lReady and barstate.isconfirmed
+
+if sigLong
+    lArmed  := false
+    lLocked := true
+else if lArmed
+    if rsi5 > longCancel
+        lArmed := false
+    else if bar_index - lArmBar >= maxWatch
+        lArmed  := false
+        lLocked := true
+
+// SHORT
+var bool  sArmed  = false
+var bool  sLocked = false
+var bool  sTurn   = false
+var bool  sFlip   = false
+var int   sArmBar = 0
+var float sExt    = na
+bool sArmEvt = false
+
+if sLocked and rsi5 <= rsiOB - rearmBuf
+    sLocked := false
+if not sLocked and rsi5 >= rsiOB
+    if not sArmed
+        sArmed  := true
+        sTurn   := false
+        sFlip   := false
+        sArmBar := bar_index
+        sExt    := rsi5
+        sArmEvt := true
+    else if rsi5 > sExt
+        sExt  := rsi5
+        sTurn := false
+        sFlip := false
+if sArmed
+    if rsi5 < rsi5[1] and sExt - rsi5 >= turnMin
+        sTurn := true
+    if stFlipDn
+        sFlip := true
+
+sStOk  = st5Bear and (stMode == "Fresh flip after RSI extreme" ? sFlip : true)
+sMtfOk = not strictMode or alignS
+sRsiOk = rsi5 >= shortCancel
+sReady = sArmed and sTurn and sStOk and emaOkS and sMtfOk and stopOkS and sRsiOk
+sigShort = sReady and barstate.isconfirmed
+
+if sigShort
+    sArmed  := false
+    sLocked := true
+else if sArmed
+    if rsi5 < shortCancel
+        sArmed := false
+    else if bar_index - sArmBar >= maxWatch
+        sArmed  := false
+        sLocked := true
+
+// ═════════════════════════════ LAST SIGNAL + SIMULATED TRADE TRACKING ═════════════════════════════
+var int   sDirLast = 0
+var int   sBarLast = 0
+var float sEntry   = na
+var float sSL      = na
+var float sTP      = na
+var bool  sAlign   = false
+
+if sigLong or sigShort
+    sDirLast := sigLong ? 1 : -1
+    sBarLast := bar_index
+    sEntry   := close
+    sSL      := st5
+    sTP      := sigLong ? close + rr * (close - st5) : close - rr * (st5 - close)
+    sAlign   := sigLong ? alignL : alignS
+
+// index 0 = historical bars (backtest-style), 1 = realtime bars since the chart was loaded (live)
+var array<int>    nTr   = array.new<int>(2, 0)
+var array<int>    nWin  = array.new<int>(2, 0)
+var array<float>  sumR  = array.new<float>(2, 0.0)
+var array<float>  eqR   = array.new<float>(2, 0.0)
+var array<float>  pkR   = array.new<float>(2, 0.0)
+var array<float>  ddR   = array.new<float>(2, 0.0)
+var array<string> hHead = array.new<string>()
+var array<string> hOut  = array.new<string>()
+
+var int   aDir     = 0
+var int   aSet     = 0
+var int   aBar     = 0
+var float aEntry   = na
+var float aSL      = na
+var float aTP      = na
+var float aStopPct = na
+var int   skipped  = 0
+
+// 1) resolve an open simulated trade (SL assumed first if both touched in the same bar)
+if aDir != 0 and bar_index > aBar and barstate.isconfirmed
+    bool hitSL = aDir == 1 ? low <= aSL : high >= aSL
+    bool hitTP = aDir == 1 ? high >= aTP : low <= aTP
+    if hitSL or hitTP
+        bool win    = hitTP and not hitSL
+        float costR = 2.0 * (feePct + slipPct) / aStopPct
+        float rM    = (win ? rr : -1.0) - costR
+        int k = aSet
+        array.set(nTr, k, array.get(nTr, k) + 1)
+        if win
+            array.set(nWin, k, array.get(nWin, k) + 1)
+        array.set(sumR, k, array.get(sumR, k) + rM)
+        float eq = array.get(eqR, k) + rM
+        array.set(eqR, k, eq)
+        float pk = math.max(array.get(pkR, k), eq)
+        array.set(pkR, k, pk)
+        array.set(ddR, k, math.max(array.get(ddR, k), pk - eq))
+        int lastIx = array.size(hOut) - 1
+        array.set(hOut, lastIx, (win ? "✔ TP " : "✘ SL ") + (rM >= 0 ? "+" : "") + str.tostring(rM, "#.00") + "R")
+        aDir := 0
+
+// 2) open a new simulated trade (one at a time; signals during an open trade are only counted as skipped)
+if sigLong or sigShort
+    if aDir == 0
+        aDir     := sigLong ? 1 : -1
+        aSet     := barstate.isrealtime ? 1 : 0
+        aBar     := bar_index
+        aEntry   := close
+        aSL      := st5
+        aTP      := sTP
+        aStopPct := math.abs(close - st5) / close * 100
+        string tag = (sigLong ? alignL : alignS) ? "ALIGNED" : "COUNTER"
+        array.push(hHead, (sigLong ? "▲ LONG " : "▼ SHORT ") + str.format_time(time, "MM-dd HH:mm") + " @" + str.tostring(close, format.mintick) + " " + tag)
+        array.push(hOut, "⏳ open")
+        if array.size(hHead) > 5
+            array.shift(hHead)
+            array.shift(hOut)
+    else
+        skipped += 1
+
+// ═════════════════════════════ ALERTS ═════════════════════════════
+tfTxt = str.tostring(timeframe.in_seconds() / 60, "#") + "m"
+trendTagL = alignL ? "TREND-ALIGNED" : "COUNTERTREND"
+trendTagS = alignS ? "TREND-ALIGNED" : "COUNTERTREND"
+msgL = "CONFIRMED LONG | " + syminfo.ticker + " | " + tfTxt + " | Entry ref " + str.tostring(close, format.mintick) + " | SL " + str.tostring(st5, format.mintick) + " | TP " + str.tostring(sTP, format.mintick) + " | RR 1:" + str.tostring(rr, "#.0#") + " | " + trendTagL
+msgS = "CONFIRMED SHORT | " + syminfo.ticker + " | " + tfTxt + " | Entry ref " + str.tostring(close, format.mintick) + " | SL " + str.tostring(st5, format.mintick) + " | TP " + str.tostring(sTP, format.mintick) + " | RR 1:" + str.tostring(rr, "#.0#") + " | " + trendTagS
+
+if useAlertFn and sigLong
+    alert(msgL, alert.freq_once_per_bar_close)
+if useAlertFn and sigShort
+    alert(msgS, alert.freq_once_per_bar_close)
+
+// Plots used by the {{plot()}} placeholders in the alertcondition() messages below
+plot(sigLong or sigShort ? sEntry : na, "Sig Entry", display=display.data_window)
+plot(sigLong or sigShort ? sSL : na,    "Sig SL",    display=display.data_window)
+plot(sigLong or sigShort ? sTP : na,    "Sig TP",    display=display.data_window)
+plot(sigLong or sigShort ? rr : na,     "Sig RR",    display=display.data_window)
+
+alertcondition(sigLong,  "CONFIRMED LONG",  'CONFIRMED LONG | {{ticker}} | {{interval}}m | Entry ref {{plot("Sig Entry")}} | SL {{plot("Sig SL")}} | TP {{plot("Sig TP")}} | RR 1:{{plot("Sig RR")}}')
+alertcondition(sigShort, "CONFIRMED SHORT", 'CONFIRMED SHORT | {{ticker}} | {{interval}}m | Entry ref {{plot("Sig Entry")}} | SL {{plot("Sig SL")}} | TP {{plot("Sig TP")}} | RR 1:{{plot("Sig RR")}}')
+alertcondition(sigLong or sigShort, "ANY CONFIRMED SIGNAL", 'CONFIRMED SIGNAL | {{ticker}} | {{interval}}m | Entry ref {{plot("Sig Entry")}} | SL {{plot("Sig SL")}} | TP {{plot("Sig TP")}} | RR 1:{{plot("Sig RR")}}')
+
+// ═════════════════════════════ CHART PLOTS ═════════════════════════════
+plot(e1, "EMA 1", color=color.new(#00E5FF, 0), linewidth=1)
+plot(e2, "EMA 2", color=color.new(#FFD600, 0), linewidth=1)
+plot(e3, "EMA 3", color=color.new(#FF9100, 0), linewidth=1)
+plot(e4, "EMA 4", color=color.new(#E040FB, 0), linewidth=2)
+plot(st5Bull ? st5 : na, "Supertrend up",   color=cLong,  style=plot.style_linebr, linewidth=1)
+plot(st5Bear ? st5 : na, "Supertrend down", color=cShort, style=plot.style_linebr, linewidth=1)
+
+plot(aDir != 0 ? aEntry : na, "Sim entry", color=color.new(color.gray, 20),  style=plot.style_linebr)
+plot(aDir != 0 ? aSL : na,    "Sim SL",    color=color.new(cShort, 10),     style=plot.style_linebr)
+plot(aDir != 0 ? aTP : na,    "Sim TP",    color=color.new(cLong, 10),      style=plot.style_linebr)
+
+plotshape(sigLong,  "Confirmed LONG",  shape.labelup,   location.belowbar, cLong,  text="LONG",  textcolor=color.white, size=size.small)
+plotshape(sigShort, "Confirmed SHORT", shape.labeldown, location.abovebar, cShort, text="SHORT", textcolor=color.white, size=size.small)
+plotshape(lArmEvt,  "Long watch armed",  shape.circle, location.belowbar, color.new(cWatch, 0), size=size.tiny)
+plotshape(sArmEvt,  "Short watch armed", shape.circle, location.abovebar, color.new(cWatch, 0), size=size.tiny)
+
+// ═════════════════════════════ DASHBOARD ═════════════════════════════
+cBg  = color.new(#131722, 0)
+cHdr = color.new(#1E222D, 0)
+cNeu = color.new(#363A45, 0)
+cTxt = color.white
+tSzBig = tSz == size.tiny ? size.small : tSz == size.small ? size.normal : size.large
+
+var table dash = table.new(tblPos, 3, 26, bgcolor=cBg, frame_color=color.new(#434651, 0), frame_width=1, border_color=color.new(#434651, 0), border_width=1)
+
+f_c(int c, int r, string t, color tc, color bg) =>
+    table.cell(dash, c, r, t, text_color=tc, bgcolor=bg, text_size=tSz, text_halign=text.align_center)
+
+f_cb(int c, int r, string t, color tc, color bg) =>
+    table.cell(dash, c, r, t, text_color=tc, bgcolor=bg, text_size=tSzBig, text_halign=text.align_center)
+
+f_chk(bool b) => b ? "✓" : "✗"
+
+f_dir(float d) => na(d) ? "–" : d < 0 ? "BULL ▲" : "BEAR ▼"
+
+f_rib(float a, float b, float c, float d, float cl) =>
+    string t = "MIXED"
+    if a > b and b > c and c > d
+        t := "BULL (full)"
+    else if a > b and b > c
+        t := "BULL"
+    else if a < b and b < c and c < d
+        t := "BEAR (full)"
+    else if a < b and b < c
+        t := "BEAR"
+    else if a > b and cl > c
+        t := "RECOVER ▲"
+    else if a < b and cl < c
+        t := "WEAKEN ▼"
+    t
+
+f_cmp(float cl, float a, float b, float c, float d) =>
+    str.tostring(emaA) + (cl > a ? "▲" : "▼") + " " + str.tostring(emaB) + (cl > b ? "▲" : "▼") + " " + str.tostring(emaC) + (cl > c ? "▲" : "▼") + " " + str.tostring(emaD) + (cl > d ? "▲" : "▼")
+
+f_wait(bool turn, bool stOk, bool emaOk, bool mtfOk, bool stopOk, bool rsiOk, string emaTxt, string stopTxt, string arrow) =>
+    string t = "All rules met – signal on candle close"
+    if not rsiOk
+        t := "RSI moved too far – setup will cancel"
+    else if not turn
+        t := "Waiting: RSI turn " + arrow
+    else if not stOk
+        t := "Waiting: 5m Supertrend confirmation"
+    else if not emaOk
+        t := "Waiting: EMA score " + emaTxt
+    else if not mtfOk
+        t := "Blocked: 15m trend disagrees (strict)"
+    else if not stopOk
+        t := stopTxt
+    t
+
+f_pct(float v) => na(v) ? "–" : str.tostring(v, "#.0") + "%"
+f_r(float v) => na(v) ? "–" : (v >= 0 ? "+" : "") + str.tostring(v, "#.00") + "R"
+
+bool recent = sDirLast != 0 and bar_index - sBarLast < holdBars
+int side = recent ? sDirLast : (lArmed ? 1 : (sArmed ? -1 : 0))
+
+if barstate.islast and showTable
+    // ---- header + status
+    f_c(0, 0, syminfo.ticker + "  " + tfTxt + "  " + str.tostring(close, format.mintick), cTxt, cHdr)
+    table.merge_cells(dash, 0, 0, 2, 0)
+
+    string stTxt = "NO TRADE"
+    color stBg = cNeu
+    color stFg = cTxt
+    if recent and sDirLast == 1
+        stTxt := "▲ CONFIRMED LONG"
+        stBg  := cLong
+    else if recent and sDirLast == -1
+        stTxt := "▼ CONFIRMED SHORT"
+        stBg  := cShort
+    else if side == 1
+        stTxt := "LONG WATCH"
+        stBg  := cWatch
+        stFg  := color.black
+    else if side == -1
+        stTxt := "SHORT WATCH"
+        stBg  := cWatch
+        stFg  := color.black
+    f_cb(0, 1, stTxt, stFg, stBg)
+    table.merge_cells(dash, 0, 1, 2, 1)
+
+    string subTxt = "No active RSI setup"
+    if recent
+        subTxt := (sAlign ? "TREND-ALIGNED" : "COUNTERTREND") + " · entry ref " + str.tostring(sEntry, format.mintick)
+    else if side == 1
+        subTxt := f_wait(lTurn, lStOk, emaOkL, lMtfOk, stopOkL, lRsiOk, str.tostring(scoreL) + "/" + str.tostring(needL), stopTxtL, "↑")
+    else if side == -1
+        subTxt := f_wait(sTurn, sStOk, emaOkS, sMtfOk, stopOkS, sRsiOk, str.tostring(scoreS) + "/" + str.tostring(needS), stopTxtS, "↓")
+    f_c(0, 2, subTxt, cTxt, cHdr)
+    table.merge_cells(dash, 0, 2, 2, 2)
+
+    // ---- trend agreement + checklist
+    string trendTxt = htfBullST and htfRibBull ? "15m BULLISH" : htfBearST and htfRibBear ? "15m BEARISH" : "15m MIXED"
+    color trendBg = htfBullST and htfRibBull ? color.new(cLong, 55) : htfBearST and htfRibBear ? color.new(cShort, 55) : cNeu
+    string agreeTxt = ""
+    if side == 1
+        agreeTxt := alignL ? " · reversal TREND-ALIGNED" : " · reversal COUNTERTREND"
+    else if side == -1
+        agreeTxt := alignS ? " · reversal TREND-ALIGNED" : " · reversal COUNTERTREND"
+    f_c(0, 3, "Trend", cTxt, cHdr)
+    f_c(1, 3, trendTxt + agreeTxt, cTxt, trendBg)
+    table.merge_cells(dash, 1, 3, 2, 3)
+
+    string chkTxt = "No setup armed"
+    if recent
+        chkTxt := "RSI✓ Turn✓ ST✓ EMA✓ 15m✓ SL✓"
+    else if side == 1
+        chkTxt := "RSI" + f_chk(lArmed) + " Turn" + f_chk(lTurn) + " ST" + f_chk(lStOk) + " EMA" + f_chk(emaOkL) + " 15m" + f_chk(lMtfOk) + " SL" + f_chk(stopOkL)
+    else if side == -1
+        chkTxt := "RSI" + f_chk(sArmed) + " Turn" + f_chk(sTurn) + " ST" + f_chk(sStOk) + " EMA" + f_chk(emaOkS) + " 15m" + f_chk(sMtfOk) + " SL" + f_chk(stopOkS)
+    f_c(0, 4, "Rules", cTxt, cHdr)
+    f_c(1, 4, chkTxt, cTxt, cHdr)
+    table.merge_cells(dash, 1, 4, 2, 4)
+
+    // ---- indicator table (5m | 15m)
+    f_c(0, 5, "", cTxt, cHdr)
+    f_c(1, 5, "5m", cTxt, cHdr)
+    f_c(2, 5, str.tostring(timeframe.in_seconds(htfTf) / 60, "#") + "m", cTxt, cHdr)
+
+    color rs5Bg = rsi5 <= rsiOS ? color.new(cLong, 40) : rsi5 >= rsiOB ? color.new(cShort, 40) : cBg
+    color rsHBg = rsiH <= rsiOS ? color.new(cLong, 40) : rsiH >= rsiOB ? color.new(cShort, 40) : cBg
+    f_c(0, 6, "RSI", cTxt, cHdr)
+    f_c(1, 6, str.tostring(rsi5, "#.0"), cTxt, rs5Bg)
+    f_c(2, 6, na(rsiH) ? "–" : str.tostring(rsiH, "#.0"), cTxt, rsHBg)
+
+    f_c(0, 7, "Supertrend", cTxt, cHdr)
+    f_c(1, 7, f_dir(st5Dir), cTxt, st5Bull ? color.new(cLong, 40) : color.new(cShort, 40))
+    f_c(2, 7, f_dir(dirH), cTxt, htfBullST ? color.new(cLong, 40) : htfBearST ? color.new(cShort, 40) : cBg)
+
+    f_c(0, 8, "Ribbon", cTxt, cHdr)
+    f_c(1, 8, f_rib(e1, e2, e3, e4, close), cTxt, cBg)
+    f_c(2, 8, f_rib(h1, h2, h3, h4, clH), cTxt, cBg)
+
+    f_c(0, 9, "Price vs EMA", cTxt, cHdr)
+    f_c(1, 9, f_cmp(close, e1, e2, e3, e4), cTxt, cBg)
+    f_c(2, 9, f_cmp(clH, h1, h2, h3, h4), cTxt, cBg)
+
+    // ---- trade plan
+    float pE = na
+    float pS = na
+    float pT = na
+    string pTag = "—"
+    if recent
+        pE := sEntry
+        pS := sSL
+        pT := sTP
+        pTag := "SIGNAL"
+    else if side == 1 and st5Bull
+        pE := close
+        pS := st5
+        pT := close + rr * (close - st5)
+        pTag := "PREVIEW"
+    else if side == -1 and st5Bear
+        pE := close
+        pS := st5
+        pT := close - rr * (st5 - close)
+        pTag := "PREVIEW"
+
+    float dist = na(pE) ? na : math.abs(pE - pS)
+    float distPct = na(dist) ? na : dist / pE * 100
+    float rrShown = na(dist) ? na : (dist > 0 ? math.abs(pT - pE) / dist : na)
+    float riskUsd = acctSize * riskPct / 100
+    float qty = na(dist) ? na : (dist > 0 ? riskUsd / dist : na)
+    float notional = na(qty) ? na : qty * pE
+
+    f_c(0, 10, "ENTRY " + pTag, cTxt, cHdr)
+    f_c(1, 10, "STOP LOSS", cTxt, cHdr)
+    f_c(2, 10, "TAKE PROFIT", cTxt, cHdr)
+    f_cb(0, 11, na(pE) ? "—" : str.tostring(pE, format.mintick), cTxt, cBg)
+    f_cb(1, 11, na(pS) ? "—" : str.tostring(pS, format.mintick), color.new(cShort, 0), cBg)
+    f_cb(2, 11, na(pT) ? "—" : str.tostring(pT, format.mintick), color.new(cLong, 0), cBg)
+
+    f_c(0, 12, na(distPct) ? "Stop dist —" : "Stop dist " + str.tostring(distPct, "#.00") + "%", cTxt, cBg)
+    f_c(1, 12, na(rrShown) ? "R:R —" : "R:R 1:" + str.tostring(rrShown, "#.0#"), cTxt, cBg)
+    f_c(2, 12, "Risk $" + str.tostring(riskUsd, "#.##"), cTxt, cBg)
+
+    f_c(0, 13, na(qty) ? "Size —" : "Size " + str.tostring(qty, "#.####"), cTxt, cBg)
+    f_c(1, 13, na(notional) ? "Notional —" : "Notional $" + str.tostring(notional, "#"), cTxt, cBg)
+    f_c(2, 13, na(notional) ? "Lev —" : "Lev " + str.tostring(notional / acctSize, "#.0") + "x", cTxt, cBg)
+
+    // ---- simulated stats (history vs live)
+    if showStats
+        int n0 = array.get(nTr, 0)
+        int n1 = array.get(nTr, 1)
+        float wr0 = n0 > 0 ? array.get(nWin, 0) * 100.0 / n0 : na
+        float wr1 = n1 > 0 ? array.get(nWin, 1) * 100.0 / n1 : na
+        float ex0 = n0 > 0 ? array.get(sumR, 0) / n0 : na
+        float ex1 = n1 > 0 ? array.get(sumR, 1) / n1 : na
+        f_c(0, 14, "Simulated", cTxt, cHdr)
+        f_c(1, 14, "Backtest*", cTxt, cHdr)
+        f_c(2, 14, "Live**", cTxt, cHdr)
+        f_c(0, 15, "Trades", cTxt, cHdr)
+        f_c(1, 15, str.tostring(n0), cTxt, cBg)
+        f_c(2, 15, str.tostring(n1), cTxt, cBg)
+        f_c(0, 16, "Win rate", cTxt, cHdr)
+        f_c(1, 16, f_pct(wr0), cTxt, cBg)
+        f_c(2, 16, f_pct(wr1), cTxt, cBg)
+        f_c(0, 17, "Net (R / $)", cTxt, cHdr)
+        f_c(1, 17, n0 > 0 ? f_r(array.get(sumR, 0)) + " / $" + str.tostring(array.get(sumR, 0) * riskUsd, "#") : "–", cTxt, cBg)
+        f_c(2, 17, n1 > 0 ? f_r(array.get(sumR, 1)) + " / $" + str.tostring(array.get(sumR, 1) * riskUsd, "#") : "–", cTxt, cBg)
+        f_c(0, 18, "Max DD", cTxt, cHdr)
+        f_c(1, 18, n0 > 0 ? str.tostring(array.get(ddR, 0), "#.00") + "R" : "–", cTxt, cBg)
+        f_c(2, 18, n1 > 0 ? str.tostring(array.get(ddR, 1), "#.00") + "R" : "–", cTxt, cBg)
+        f_c(0, 19, "Expectancy", cTxt, cHdr)
+        f_c(1, 19, f_r(ex0), cTxt, cBg)
+        f_c(2, 19, f_r(ex1), cTxt, cBg)
+
+    // ---- last 5 signals
+    if showHist
+        int hn = array.size(hHead)
+        for i = 0 to 4
+            int row = 20 + i
+            if i < hn
+                int ix = hn - 1 - i
+                f_c(0, row, array.get(hHead, ix) + "  " + array.get(hOut, ix), cTxt, cBg)
+            else
+                f_c(0, row, "", cTxt, cBg)
+            table.merge_cells(dash, 0, row, 2, row)
+
+    // ---- notes / warnings
+    string note = "*loaded history, after fees/slip. **since chart load (resets on reload). Skipped: " + str.tostring(skipped)
+    if timeframe.in_seconds() != 300
+        note := "⚠ Chart is " + tfTxt + " — designed for 5m. " + note
+    if timeframe.in_seconds(htfTf) <= timeframe.in_seconds()
+        note := "⚠ Trend TF must be higher than chart TF. " + note
+    f_c(0, 25, note, color.new(cTxt, 30), cBg)
+    table.merge_cells(dash, 0, 25, 2, 25)
